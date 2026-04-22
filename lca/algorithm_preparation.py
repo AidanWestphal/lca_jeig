@@ -991,7 +991,12 @@ def prepare_jeig(common_data, config):
     cluster_validator = common_data.get('cluster_validator')
     
     classifier_units = {}
-    primary_embeddings = embeddings_dict[verifier_name]()
+    
+    # --- FIX: Check if it's a function before calling it ---
+    primary_embeddings = embeddings_dict[verifier_name]
+    if callable(primary_embeddings):
+        primary_embeddings = primary_embeddings()
+    # -------------------------------------------------------
     
     if verifier_name in weighters:
         classifier = WeighterBasedClassifier(weighters[verifier_name])

@@ -68,7 +68,7 @@ class LCAv3JEIGAlgorithm:
         self.Q = self._calculate_mean_field(self.M)
         
         # 4. Generate Candidate Pool (Uncertain edges -- haven't been viewed by a human)
-        candidate_pool = self._get_candidate_pool()
+        candidate_pool = self._generate_candidate_pool()
         if not candidate_pool:
             logger.info("No candidates available. Marking as finished.")
             self.phase = "FINISHED"
@@ -229,14 +229,113 @@ class LCAv3JEIGAlgorithm:
             
         return Q
 
-    def _get_candidate_pool(self) -> List[Tuple]:
-        # For simplicity we only care about non-viewed edges
-        pool = []
-        for u, v, data in self.G.edges(data=True):
-            if data.get('ranker') != 'human':
-                pool.append((u, v))
+
+    def _gumbel_softmax_sample(self, p_pos: float, tau: float = 0.5) -> float:
+        """Draws a soft label [-1, 1] using Gumbel-Softmax relaxation."""
+        p_pos = np.clip(p_pos, 1e-10, 1.0 - 1e-10)
+        p_neg = 1.0 - p_pos
+
+        g_pos = -np.log(-np.log(np.random.uniform(1e-10, 1.0)))
+        g_neg = -np.log(-np.log(np.random.uniform(1e-10, 1.0)))
+
+        logit_pos = (np.log(p_pos) + g_pos) / tau
+        logit_neg = (np.log(p_neg) + g_neg) / tau
+
+        max_logit = max(logit_pos, logit_neg)
+        exp_pos = np.exp(logit_pos - max_logit)
+        exp_neg = np.exp(logit_neg - max_logit)
+
+        sum_exp = exp_pos + exp_neg
+        
+        # Returns a continuous soft-label
+        return (exp_pos / sum_exp * 1.0) + (exp_neg / sum_exp * -1.0)
+
+
+    def _generate_candidate_pool(self) -> Dict[Tuple, float]:
+        """
+        Calculates entropy for ALL edges. Human-reviewed edges will naturally 
+        have ~0 entropy and fall to the bottom. Returns the Top N most uncertain.
+        """
+        edge_entropies = {}
+        
+        for u, v in self.G.edges():
+            edge_entropies[(u, v)] = self._calculate_entropy((u, v), self.Q)
+            
+        # Sort by highest entropy and take the top N (e.g., 50 or 500)
+        sorted_edges = sorted(edge_entropies, key=edge_entropies.get, reverse=True)[:self.candidate_pool_size]
+        
+        return {edge: edge_entropies[edge] for edge in sorted_edges}
+
+
+    def _run_monte_carlo_jeig(self, candidate_pool: Dict[Tuple, float]) -> List[Tuple]:
+        logger.debug(f"Executing JEIG over Candidate Pool of {len(candidate_pool)}.")
+        
+        m = 5       # M subsets
+        n = 50      # N configurations
+        tau = 0.5   # Gumbel Temperature
+        
+        pool_edges = list(candidate_pool.keys())
+        alpha_JEIG = {edge: 0.0 for edge in pool_edges}
+        
+        # Outer Loop: Select M subsets (size 1)
+        for i in range(m):
+            Di = random.sample(pool_edges, 1)
+            
+            Di_probs = []
+            for edge in Di:
+                u, v = edge
+                idu, idv = self.node2idx[u], self.node2idx[v]
+                p_pos = np.clip(np.sum(self.Q[idu] * self.Q[idv]), 1e-10, 1.0 - 1e-10)
+                Di_probs.append((edge, p_pos))
+            
+            # Inner Loop: Sample N configurations
+            for j in range(n):
+                S_conditional = []
                 
-        return pool[:self.candidate_pool_size]
+                # Sample configuration using Gumbel-Softmax
+                for edge, p_pos in Di_probs:
+                    soft_label = self._gumbel_softmax_sample(p_pos, tau=tau)
+                    S_conditional.append((edge, soft_label))
+                    
+                # Rerun Mean Field with the SOFT configuration
+                Q_cond = self._calculate_mean_field(self.M, S_conditional)
+                
+                # Accumulate the conditional entropy for the candidate pool
+                for edge in pool_edges:
+                    alpha_JEIG[edge] += (1.0 / n) * self._calculate_entropy(edge, Q_cond)
+                    
+        # Calculate Final Information Gain: I = H(e) - E[H(e|Di)]
+        I_JEIG = {}
+        for edge, base_entropy in candidate_pool.items():
+            I_JEIG[edge] = base_entropy - (1.0 / m) * alpha_JEIG[edge]
+            
+        sorted_edges = sorted(I_JEIG, key=I_JEIG.get, reverse=True)
+        
+        if sorted_edges:
+            top_score = I_JEIG[sorted_edges[0]]
+            avg_score = np.mean(list(I_JEIG.values()))
+            logger.info(f"JEIG Status | Top EIG: {top_score:.5f} | Avg EIG: {avg_score:.5f}")
+            
+            # Terminate if the graph is stable
+            if top_score < 0.0001:
+                logger.info("JEIG Converged: Max expected information gain is virtually zero.")
+                self.phase = "FINISHED"
+                return []
+                
+        return [(u, v, "human") for u, v in sorted_edges[:self.batch_size]]
+    
+    # def _get_unreviewed_edges(self) -> List[Tuple]:
+    #     """Returns all edges in the graph that have not yet been reviewed by a human."""
+    #     unreviewed_edges = []
+    #     for u, v in self.G.edges():
+    #         # Check your query history
+    #         history = self.query_history.get((u, v), [])
+    #         is_human_reviewed = any(ranker == 'human' for score, ranker in history)
+            
+    #         if not is_human_reviewed:
+    #             unreviewed_edges.append((u, v))
+                
+    #     return unreviewed_edges
     
     def _calculate_entropy(self, edge, Q):
         # Calculate entropy for an edge conditional on Q probs
@@ -255,39 +354,6 @@ class LCAv3JEIGAlgorithm:
         p_neg = np.clip(p_neg, eps, 1.0 - eps)
         
         return -p_pos * np.log2(p_pos) - p_neg * np.log2(p_neg)
-
-    def _run_monte_carlo_jeig(self, candidate_pool: List[Tuple]) -> List[Tuple]:
-        logger.debug("Executing Monte Carlo Info Gain")
-        alpha_JEIG = {}
-
-        # 1. Outer Loop: Sample subsets of edges
-        sample_size = max(1, int(len(candidate_pool) * self.pair_sample_fraction))
-        
-        for i in range(self.pair_sample_count):
-            Di = random.sample(candidate_pool, sample_size)
-            
-            # 2. Inner Loop: Monte Carlo over cluster assignments
-            for j in range(self.cluster_sample_count):
-                # Sample random edge assignments specifically for the subset Di
-                edges = np.random.choice([-1.0, 1.0], size=len(Di))
-                S_conditional = list(zip(Di, edges))
-                
-                # Get conditional probabilities
-                Q_di = self._calculate_mean_field(self.M, S_conditional)
-                
-                # Update JEIG scores
-                for edge in Di:
-                    if edge not in alpha_JEIG:
-                        alpha_JEIG[edge] = 0.0
-                    alpha_JEIG[edge] += (1 / self.cluster_sample_count) * self._calculate_entropy(edge, Q_di)
-        
-        # 3. Final calculations: H(edge) - Expected[H(edge | Di)]
-        for edge, expected_conditional_entropy in alpha_JEIG.items():
-            base_entropy = self._calculate_entropy(edge, self.Q)
-            alpha_JEIG[edge] = base_entropy - (1 / self.pair_sample_count) * expected_conditional_entropy
-        
-        sorted_edges = sorted(alpha_JEIG, key=alpha_JEIG.get, reverse=True)
-        return [(u, v, "human") for u, v in sorted_edges[:self.batch_size]]
     
 
     def show_stats(self):
