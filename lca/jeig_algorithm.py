@@ -35,7 +35,7 @@ class LCAv3JEIGAlgorithm:
         self.cluster_sample_count = jeig_params.get('cluster_sample_count', 50)
         
         # Termination Parameters
-        self.max_human_reviews = self.config.get('max_human_reviews', 1000)
+        self.max_human_reviews = jeig_params.get('max_human_reviews', 5000)
         self.num_human_reviews = 0
         self.phase = "ACTIVE" # ACTIVE -> FINISHED
         
