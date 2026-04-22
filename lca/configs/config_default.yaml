@@ -1,7 +1,7 @@
 exp_name: grevyszebra_consistency
 species: Grevys zebra
 comment: Experiment comment goes here
-algorithm_type: gc
+algorithm_type: jeig # UPDATE TO JEIG
 data:
   images_dir: /ekaterina/work/data/zebra/images
   separate_by_fields: 
@@ -58,3 +58,12 @@ gc:
   verifier_name: miewid
   theta: 0.1
   validation_step: 20
+jeig:
+  batch_size: 5
+  candidate_pool_size: 50
+  beta: 1
+  threshold: 0.5
+  human_weight: 2
+  pair_sample_count: 5
+  pair_sample_fraction: 0.02
+  cluster_sample_count: 50

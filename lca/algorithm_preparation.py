@@ -39,6 +39,7 @@ from manual_review_algorithm import ManualReviewAlgorithm
 from thresholded_review_algorithm import ThresholdedReviewAlgorithm
 from hdbscan_embeddings import HDBSCANEmbeddings
 from stability_algorithm import LCAv3StabilityAlgorithm
+from jeig_algorithm import LCAv3JEIGAlgorithm
 
 logger = logging.getLogger('lca')
 
@@ -848,7 +849,9 @@ def create_algorithm(config):
     elif algorithm_type == 'thresholded_review':
         algorithm = prepare_thresholded_review(common_data, config)
     elif algorithm_type == 'stability':
-        algorithm = prepare_stability(common_data, config)
+        algorithm = prepare_stability(common_data, config)    
+    elif algorithm_type == 'jeig':
+        algorithm = prepare_jeig(common_data, config)
     else:
         raise ValueError(f"Unknown algorithm type: {algorithm_type}")
     
@@ -856,6 +859,40 @@ def create_algorithm(config):
 
 
     return algorithm, common_data
+
+
+def prepare_jeig(common_data, config):
+    logger.info("Building JEIG algorithm components...")
+    
+    embeddings_dict = common_data['embeddings_dict']
+    weighters = common_data['weighters']
+    verifier_name = common_data['verifier_name']
+    cluster_validator = common_data.get('cluster_validator')
+    
+    classifier_units = {}
+    primary_embeddings = embeddings_dict[verifier_name]()
+    
+    if verifier_name in weighters:
+        classifier = WeighterBasedClassifier(weighters[verifier_name])
+        classifier_units[verifier_name] = (primary_embeddings, classifier)
+    else:
+        logger.warning(f"No weighter found for {verifier_name}.")
+        # Fallback if no weighter exists
+        classifier = ThresholdBasedClassifier(threshold=0.5)
+        classifier_units[verifier_name] = (primary_embeddings, classifier)
+
+    classifier_manager = ClassifierManager(
+        verifier_names=[verifier_name],
+        classifier_units=classifier_units
+    )
+    
+    algorithm = LCAv3JEIGAlgorithm(
+        config=config,
+        classifier_manager=classifier_manager,
+        cluster_validator=cluster_validator
+    )
+    
+    return algorithm
 
 
 def prepare_hdbscan(common_data, config):
