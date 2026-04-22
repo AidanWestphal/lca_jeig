@@ -4,6 +4,7 @@ Handles all common setup logic for both LCA and Graph Consistency algorithms.
 """
 
 import types
+import math
 import numpy as np
 import random
 import os
@@ -38,7 +39,10 @@ from hdbscan_algorithm import HDBSCANAlgorithm
 from manual_review_algorithm import ManualReviewAlgorithm
 from thresholded_review_algorithm import ThresholdedReviewAlgorithm
 from hdbscan_embeddings import HDBSCANEmbeddings
+from kmeans_embeddings import KMeansEmbeddings
 from stability_algorithm import LCAv3StabilityAlgorithm
+from np3_aas_algorithm import NP3AASAlgorithm
+from nis_algorithm import NISAlgorithm
 from jeig_algorithm import LCAv3JEIGAlgorithm
 
 logger = logging.getLogger('lca')
@@ -56,7 +60,7 @@ def parse_verifier_names(verifier_names):
     """
     parsed_verifiers = []
     
-    meta_names = ['metadata', 'tracking', 'negative_only', 'hdbscan']
+    meta_names = ['metadata', 'tracking', 'negative_only', 'hdbscan', 'kmeans']
 
     i = 0
     while i < len(verifier_names):
@@ -106,7 +110,8 @@ def prepare_common(config):
         images_dir = None
 
     data_params['images_dir'] = images_dir
-    algorithm_config = config.get('lca', config.get('gc', {}))  # Fallback to available config
+    algorithm_type = config.get('algorithm_type', 'lca')
+    algorithm_config = config.get(algorithm_type, config.get('lca', config.get('gc', {})))  # Use algorithm-specific config
     
     # 1. Load and preprocess data
     logger.info("Loading embeddings and preprocessing data...")
@@ -190,11 +195,16 @@ def prepare_common(config):
     
     prob_human_correct = edge_weights.get('prob_human_correct', 0.98)
     # aug_names = edge_weights.get('augmentation_names', 'miewid human').split()
-    verifier_name = algorithm_config.get('verifier_name', 'miewid')
-    
+    verifier_name_raw = algorithm_config.get('verifier_name', 'miewid')
+    if isinstance(verifier_name_raw, list):
+        init_verifiers = verifier_name_raw
+    else:
+        init_verifiers = verifier_name_raw.split()
+    verifier_name = init_verifiers[0]  # Primary init verifier (backward compat)
+
     verifier_names_str = edge_weights.get('verifier_names', edge_weights.get('augmentation_names', 'miewid human'))
     aug_names = verifier_names_str.split() if isinstance(verifier_names_str, str) else verifier_names_str
-    parsed_verifiers = parse_verifier_names(aug_names + [verifier_name])
+    parsed_verifiers = parse_verifier_names(aug_names + init_verifiers)
 
     # Backwards compatibility: handle old "human" + simulate_human flag
     simulate_human = algorithm_config.get('simulate_human', True)
@@ -274,11 +284,53 @@ def prepare_common(config):
                 base_embeddings, df, node2uuid, id_key, class_key='tracking_id', multiplier=1)
             )
         elif name == 'hdbscan':
-            # Create tracking ID wrapper
+            # Create HDBSCAN wrapper
             base_embeddings = embeddings_dict[base_name]()
             embeddings_dict[f'hdbscan({base_name})'] = lazy(lambda: HDBSCANEmbeddings(
                 base_embeddings.embeddings, node2uuid, print_func=logger.info)
             )
+        elif name == 'kmeans':
+            # Compute base embeddings threshold using classifier config
+            base_embeddings = embeddings_dict[base_name]()
+            cls_thresholds = edge_weights.get('classifier_thresholds', {})
+            base_spec = cls_thresholds.get(base_name, 'auto(0.15)')
+            if isinstance(base_spec, str) and 'auto' in base_spec:
+                match = re.match(r'auto\((\d+\.?\d*)\)', base_spec)
+                fraction = float(match.group(1)) if match else 0.15
+                thresh_emb = unfiltered_embeddings_dict.get(base_name)
+                if thresh_emb is not None and callable(thresh_emb):
+                    thresh_emb = thresh_emb()
+                elif thresh_emb is None:
+                    thresh_emb = base_embeddings
+                base_threshold = robust_gmm_find_threshold(
+                    np.array(thresh_emb.get_all_scores()),
+                    entropy_alpha=1 - fraction, verbose=True, print_func=logger.info,
+                    plot_path=config.get('logging', {}).get('auto_threshold_plot_path'))
+            else:
+                base_threshold = float(base_spec)
+            # Cache threshold and predicted F1 on base embeddings so classifier system can reuse it
+            base_embeddings._cached_gmm_threshold = base_threshold
+            base_embeddings._cached_gmm_predicted_f1 = getattr(robust_gmm_find_threshold, '_last_predicted_f1', None)
+            stability_cfg = config.get('stability', {})
+            kmeans_min_cluster_size = stability_cfg.get('kmeans_min_cluster_size', 1)
+            kmeans_fallback_cluster_size = stability_cfg.get('kmeans_fallback_cluster_size', 1)
+            n_nodes = len(base_embeddings.ids)
+            kmeans_max_k = n_nodes // kmeans_min_cluster_size if kmeans_min_cluster_size > 1 else None
+            def _make_kmeans(base_emb=base_embeddings, node2uuid=node2uuid,
+                             threshold=base_threshold, max_k=kmeans_max_k,
+                             fallback_size=kmeans_fallback_cluster_size,
+                             fallback_emb=base_embeddings):
+                km = KMeansEmbeddings(base_emb, node2uuid, threshold=threshold,
+                                      max_k=max_k, print_func=logger.info)
+                max_cluster_size = int(np.bincount(km.labels).max())
+                if max_cluster_size < fallback_size:
+                    logger.info(
+                        f"KMeansEmbeddings: max cluster size {max_cluster_size} < "
+                        f"{fallback_size}, falling back to base embeddings"
+                    )
+                    return fallback_emb
+                return km
+            embeddings_dict[f'kmeans({base_name})'] = lazy(_make_kmeans)
 
     logger.info("Computing and logging verifier performance statistics...")
     primary_verifier_embeddings = embeddings_dict[verifier_name]()
@@ -300,8 +352,10 @@ def prepare_common(config):
     for aug_name in aug_names:
         if 'human' not in aug_name:
             embeddings_dict[aug_name] = embeddings_dict[aug_name]()
-    if verifier_name not in aug_names:
-        embeddings_dict[verifier_name] = embeddings_dict[verifier_name]()
+    for iv_name in init_verifiers:
+        if iv_name not in aug_names:
+            if callable(embeddings_dict.get(iv_name)):
+                embeddings_dict[iv_name] = embeddings_dict[iv_name]()
     
     algorithm_type = config.get('algorithm_type', 'gc')
 
@@ -382,6 +436,7 @@ def prepare_common(config):
         'df': df,
         'filter_key': filter_key,
         'verifier_name': verifier_name,
+        'init_verifiers': init_verifiers,
         'output_path': output_path,
         'target_edges': target_edges,
         'initial_topk': initial_topk,
@@ -849,6 +904,11 @@ def create_algorithm(config):
     elif algorithm_type == 'thresholded_review':
         algorithm = prepare_thresholded_review(common_data, config)
     elif algorithm_type == 'stability':
+        algorithm = prepare_stability(common_data, config)
+    elif algorithm_type == 'np3_aas':
+        algorithm = prepare_np3_aas(common_data, config)
+    elif algorithm_type == 'nis':
+        algorithm = prepare_nis(common_data, config)
         algorithm = prepare_stability(common_data, config)    
     elif algorithm_type == 'jeig':
         algorithm = prepare_jeig(common_data, config)
@@ -956,6 +1016,133 @@ def prepare_thresholded_review(common_data, config):
     return thresholded_instance
 
 
+def estimate_num_individuals_from_topk(embeddings, threshold, topk=10):
+    """
+    Estimate the number of individuals by counting connected components
+    of the top-k graph after thresholding.
+
+    Builds the same top-k neighbor graph used by the algorithm, classifies
+    edges as positive (above threshold) or negative, then counts the
+    connected components of positive edges. This gives a much better
+    estimate than pi_positive because it accounts for graph structure.
+
+    Args:
+        embeddings: Embeddings object with get_edges() method
+        threshold: Classifier threshold for positive/negative classification
+        topk: Number of nearest neighbors (should match initial_topk)
+
+    Returns:
+        tuple: (estimated_num_individuals, predicted_f1_or_none)
+    """
+    import networkx as nx
+
+    # Get top-k edges with scores
+    edges = list(embeddings.get_edges(topk=topk, target_edges=0, target_proportion=0))
+    if not edges:
+        n = len(embeddings.ids) if hasattr(embeddings, 'ids') else 0
+        logger.info(f"Estimated num_individuals from top-k graph: {n} (no edges)")
+        return n
+
+    # Build graph of positive edges only
+    G = nx.Graph()
+    all_nodes = set()
+    n_positive = 0
+    n_negative = 0
+    for edge in edges:
+        n0, n1 = edge[0], edge[1]
+        score = edge[2] if len(edge) > 2 else 0.0
+        all_nodes.add(n0)
+        all_nodes.add(n1)
+        if score > threshold:
+            G.add_edge(n0, n1)
+            n_positive += 1
+        else:
+            n_negative += 1
+
+    # Add isolated nodes (no positive edges)
+    for node in all_nodes:
+        if node not in G:
+            G.add_node(node)
+
+    num_components = nx.number_connected_components(G)
+    n_total = len(all_nodes)
+    logger.info(f"Estimated num_individuals from top-k graph: {num_components} "
+                f"({n_positive} positive, {n_negative} negative edges, "
+                f"{n_total} nodes, threshold={threshold:.4f})")
+    return num_components
+
+
+def auto_compute_stability_params(stability_config, algorithm_config, num_nodes, num_individuals, predicted_f1=None):
+    """
+    Auto-compute stability parameters marked with 'auto' in the config.
+
+    Uses dataset statistics (num_nodes, num_individuals) to derive sensible
+    values for parameters that depend on data characteristics.
+
+    Args:
+        stability_config: Stability section of the config (modified in-place)
+        algorithm_config: Algorithm section of the config (modified in-place)
+        num_nodes: Number of annotations (nodes in the graph)
+        num_individuals: Estimated number of individuals (from top-k graph components)
+        predicted_f1: GMM threshold's predicted F1 (classifier quality indicator)
+    """
+    avg_sightings = num_nodes / max(1, num_individuals)
+    logger.info(f"Auto-computing stability parameters: num_nodes={num_nodes}, "
+                f"num_individuals(estimated)={num_individuals}, avg_sightings={avg_sightings:.2f}")
+
+    # initial_topk: auto = max(10, ceil(20 / avg_sightings))
+    if algorithm_config.get('initial_topk') == 'auto':
+        val = max(10, math.ceil(20 / max(avg_sightings, 1e-6)))
+        algorithm_config['initial_topk'] = val
+        logger.info(f"  Auto initial_topk = {val}")
+
+    # max_densify_edges: auto = min(1000, num_nodes * avg_sightings)
+    if stability_config.get('max_densify_edges') == 'auto':
+        val = min(1000, int(num_nodes * avg_sightings))
+        stability_config['max_densify_edges'] = val
+        logger.info(f"  Auto max_densify_edges = {val}")
+
+    # sparsify_on_init: auto = (avg_sightings > 3)
+    if stability_config.get('sparsify_on_init') == 'auto':
+        val = (avg_sightings > 3)
+        stability_config['sparsify_on_init'] = val
+        logger.info(f"  Auto sparsify_on_init = {val}")
+
+    # tries_before_edge_done: auto = ceil(1.0 / review_confidence)
+    if stability_config.get('tries_before_edge_done') == 'auto':
+        review_confidence = stability_config.get('review_confidence', 0.5)
+        val = math.ceil(1.0 / max(review_confidence, 1e-6))
+        stability_config['tries_before_edge_done'] = val
+        stability_config['_tries_was_auto'] = True
+        logger.info(f"  Auto tries_before_edge_done = {val}")
+
+    # max_phase0_iterations: auto = max(20, num_nodes // 100)
+    if stability_config.get('max_phase0_iterations') == 'auto':
+        val = max(20, num_nodes // 100)
+        stability_config['max_phase0_iterations'] = val
+        logger.info(f"  Auto max_phase0_iterations = {val}")
+
+    # review_confidence: auto = based on classifier predicted F1
+    # High predicted F1 means classifier is accurate, so reviews should be decisive
+    # Low predicted F1 means classifier is noisy, so reviews should be gradual
+    if stability_config.get('review_confidence') == 'auto':
+        if predicted_f1 is not None and predicted_f1 > 0:
+            # Map predicted F1 to review_confidence: F1=0.95+ -> 0.97, F1=0.7 -> 0.5
+            val = min(0.97, max(0.5, predicted_f1))
+            stability_config['review_confidence'] = val
+            logger.info(f"  Auto review_confidence = {val:.2f} (from predicted F1={predicted_f1:.4f})")
+        else:
+            stability_config['review_confidence'] = 0.5
+            logger.info(f"  Auto review_confidence = 0.5 (no predicted F1 available)")
+
+        # Recompute tries_before_edge_done if it was auto (depends on review_confidence)
+        if stability_config.get('tries_before_edge_done') == 'auto' or stability_config.get('_tries_was_auto'):
+            review_confidence = stability_config['review_confidence']
+            val = math.ceil(1.0 / max(review_confidence, 1e-6))
+            stability_config['tries_before_edge_done'] = val
+            logger.info(f"  Recomputed tries_before_edge_done = {val} (for review_confidence={review_confidence:.2f})")
+
+
 def prepare_stability(common_data, config):
     """
     Prepare LCA v3 (stability-driven) algorithm instance.
@@ -988,11 +1175,15 @@ def prepare_stability(common_data, config):
     stability_config['validation_step'] = stability_config.get('validation_step', 100)
     stability_config['max_densify_edges'] = stability_config.get('max_densify_edges', 2000)
     stability_config['cross_pcc_max_edges'] = stability_config.get('cross_pcc_max_edges', 10000)
-    stability_config['merge_priority'] = stability_config.get('merge_priority', 0.7)  # Prioritize merge candidates
 
     # Phase 0 aggressiveness controls
     stability_config['phase0_alpha'] = stability_config.get('phase0_alpha', 0.0)  # 0.0 = strict, -0.1 = lenient
+    stability_config['max_phase0_iterations'] = stability_config.get('max_phase0_iterations', 20)
     stability_config['densify_prioritize_negatives'] = stability_config.get('densify_prioritize_negatives', False)
+    stability_config['structural_weight'] = stability_config.get('structural_weight', 0.0)
+    stability_config['confidence_weight'] = stability_config.get('confidence_weight', 0.0)
+    stability_config['sampling_temperature'] = stability_config.get('sampling_temperature', 0.0)
+    stability_config['unverified_threshold_step'] = stability_config.get('unverified_threshold_step', 0.0)
 
     algorithm_params = config.get("algorithm", {})
     lca_config = config.get("lca", {})
@@ -1000,15 +1191,47 @@ def prepare_stability(common_data, config):
                                                  lca_config.get('iterations', {}).get('tries_before_edge_done', 4))
     stability_config["tries_before_edge_done"] = tries_before_edge_done
 
+    # Auto-compute parameters marked with 'auto' based on dataset statistics
+    num_nodes = len(common_data['node2uuid'])
+
+    # Estimate num_individuals from top-k graph connected components (no ground truth needed)
+    primary_embeddings = common_data['embeddings_dict'].get('miewid')
+    predicted_f1 = None
+    if primary_embeddings is not None:
+        if callable(primary_embeddings):
+            primary_embeddings = primary_embeddings()
+        # Get classifier threshold (already computed at this point)
+        cls_thresholds = config.get('edge_weights', {}).get('classifier_thresholds', {})
+        threshold_val = cls_thresholds.get('miewid', 0.7)
+        if isinstance(threshold_val, str) and 'auto' in threshold_val:
+            threshold_val = getattr(primary_embeddings, '_cached_gmm_threshold', 0.7)
+        threshold_val = float(threshold_val)
+        # Get predicted F1 from GMM (cached during threshold computation)
+        predicted_f1 = getattr(primary_embeddings, '_cached_gmm_predicted_f1', None)
+        topk = algorithm_params.get('initial_topk', 10)
+        if topk == 'auto':
+            topk = 10  # use default for estimation, will be recomputed
+        num_individuals = estimate_num_individuals_from_topk(primary_embeddings, threshold_val, topk=topk)
+    else:
+        num_individuals = num_nodes  # fallback: assume all singletons
+
+    auto_compute_stability_params(stability_config, algorithm_params, num_nodes, num_individuals, predicted_f1=predicted_f1)
+
+    # Update common_data with potentially auto-computed initial_topk
+    if 'initial_topk' in algorithm_params:
+        common_data['initial_topk'] = algorithm_params['initial_topk']
+
     logger.info(f"Stability algorithm config:")
     logger.info(f"  theta: {stability_config['theta']}")
     logger.info(f"  target_alpha: {stability_config['target_alpha']}")
     logger.info(f"  phase0_alpha: {stability_config['phase0_alpha']}")
     logger.info(f"  max_human_reviews: {stability_config['max_human_reviews']}")
     logger.info(f"  review_confidence: {stability_config['review_confidence']}")
-    logger.info(f"  merge_priority: {stability_config['merge_priority']}")
-    logger.info(f"  densify_prioritize_negatives: {stability_config['densify_prioritize_negatives']}")
 
+    logger.info(f"  densify_prioritize_negatives: {stability_config['densify_prioritize_negatives']}")
+    logger.info(f"  structural_weight: {stability_config['structural_weight']}")
+    logger.info(f"  sampling_temperature: {stability_config['sampling_temperature']}")
+    logger.info(f"  unverified_threshold_step: {stability_config['unverified_threshold_step']}")
     # Build classifier manager (reuse GC's classifier setup)
     verifier_names_str = edge_weights.get('verifier_names', edge_weights.get('augmentation_names', 'miewid human'))
     verifier_names = verifier_names_str.split() if isinstance(verifier_names_str, str) else verifier_names_str
@@ -1040,28 +1263,35 @@ def prepare_stability(common_data, config):
     # First pass: process direct thresholds (numbers and auto())
     for name, (embeddings, threshold) in direct_thresholds.items():
         if isinstance(threshold, str) and "auto" in threshold:
-            import re
-            match = re.match(r'auto\((\d+\.?\d*)\)', threshold)
-            threshold_fraction = float(match.group(1)) if match else 0.15
-
-            unfiltered_embeddings_dict = common_data.get('unfiltered_embeddings_dict', {})
-            if name in unfiltered_embeddings_dict:
-                thresh_embeddings = unfiltered_embeddings_dict[name]
-                if isinstance(thresh_embeddings, types.FunctionType):
-                    thresh_embeddings = thresh_embeddings()
+            # Check if threshold was already computed (e.g. by KMeansEmbeddings setup)
+            if hasattr(embeddings, '_cached_gmm_threshold'):
+                threshold = embeddings._cached_gmm_threshold
+                logger.info(f"Reusing cached GMM threshold for {name}: {threshold}")
             else:
-                thresh_embeddings = embeddings
+                import re
+                match = re.match(r'auto\((\d+\.?\d*)\)', threshold)
+                threshold_fraction = float(match.group(1)) if match else 0.15
 
-            if hasattr(embeddings, 'get_base'):
-                thresh_embeddings = embeddings.get_base()
+                unfiltered_embeddings_dict = common_data.get('unfiltered_embeddings_dict', {})
+                if name in unfiltered_embeddings_dict:
+                    thresh_embeddings = unfiltered_embeddings_dict[name]
+                    if isinstance(thresh_embeddings, types.FunctionType):
+                        thresh_embeddings = thresh_embeddings()
+                else:
+                    thresh_embeddings = embeddings
 
-            threshold = robust_gmm_find_threshold(
-                np.array(thresh_embeddings.get_all_scores()),
-                entropy_alpha=1-threshold_fraction,
-                verbose=True,
-                print_func=logger.info,
-                plot_path=robust_plot_path
-            )
+                if hasattr(embeddings, 'get_base'):
+                    thresh_embeddings = embeddings.get_base()
+
+                threshold = robust_gmm_find_threshold(
+                    np.array(thresh_embeddings.get_all_scores()),
+                    entropy_alpha=1-threshold_fraction,
+                    verbose=True,
+                    print_func=logger.info,
+                    plot_path=robust_plot_path
+                )
+                # Cache predicted F1 for auto review_confidence computation
+                embeddings._cached_gmm_predicted_f1 = getattr(robust_gmm_find_threshold, '_last_predicted_f1', None)
 
         classifier = ThresholdBasedClassifier(threshold)
         logger.info(f"Created threshold-based classifier for {name} with threshold {threshold}")
@@ -1101,6 +1331,29 @@ def prepare_stability(common_data, config):
             logger.warning(f"No threshold for {name}, using default auto threshold {threshold}")
             classifier_units[name] = (embeddings, classifier)
 
+    # Ensure all init verifiers have classifiers (needed for labeling initial edges)
+    for init_verifier in common_data.get('init_verifiers', []):
+        if init_verifier not in classifier_units:
+            init_embeddings = common_data['embeddings_dict'].get(init_verifier)
+            if init_embeddings is not None:
+                if isinstance(init_embeddings, types.FunctionType):
+                    init_embeddings = init_embeddings()
+                # If a kmeans wrapper fell back to base embeddings, reuse the base classifier
+                if not isinstance(init_embeddings, KMeansEmbeddings) and init_verifier.startswith('kmeans('):
+                    base_name = init_verifier[len('kmeans('):-1]
+                    if base_name in classifier_units:
+                        logger.info(
+                            f"Init verifier '{init_verifier}' fell back to base embeddings; "
+                            f"reusing '{base_name}' classifier"
+                        )
+                        classifier_units[init_verifier] = (init_embeddings, classifier_units[base_name][1])
+                        continue
+                # kmeans wrappers use 0.5 as natural threshold by design
+                default_threshold = 0.5
+                classifier = ThresholdBasedClassifier(default_threshold)
+                logger.info(f"Created default classifier for init verifier '{init_verifier}' with threshold {default_threshold}")
+                classifier_units[init_verifier] = (init_embeddings, classifier)
+
     classifier_manager = ClassifierManager(
         verifier_names=verifier_names,
         classifier_units=classifier_units
@@ -1114,6 +1367,257 @@ def prepare_stability(common_data, config):
     )
 
     return stability_instance
+
+
+def prepare_np3_aas(common_data, config):
+    """
+    Prepare NP3+AAS algorithm instance.
+
+    Args:
+        common_data: Common data from prepare_common
+        config: Configuration dictionary
+
+    Returns:
+        NP3AASAlgorithm: Configured algorithm instance
+    """
+    np3_config = config.get('np3_aas', {}).copy()
+
+    # Merge edge_weights settings
+    edge_weights = config.get('edge_weights', {})
+    np3_config['prob_human_correct'] = edge_weights.get('prob_human_correct', 0.98)
+
+    # Set defaults
+    np3_config.setdefault('max_human_reviews', 5000)
+    np3_config.setdefault('edges_per_review_batch', 200)
+    np3_config.setdefault('validation_step', 100)
+    np3_config.setdefault('dbscan_eps', 0.5)
+    np3_config.setdefault('dbscan_min_samples', 2)
+    np3_config.setdefault('dbscan_metric', 'cosine')
+    np3_config.setdefault('s_min', 0.3)
+    np3_config.setdefault('k_max', 5)
+    np3_config.setdefault('epsilon', 0.6)
+    np3_config.setdefault('verifier_name', common_data['verifier_name'])
+
+    # Build classifier manager (same pattern as prepare_stability)
+    verifier_names_str = edge_weights.get('verifier_names',
+                                          edge_weights.get('augmentation_names', 'miewid human'))
+    verifier_names = verifier_names_str.split() if isinstance(verifier_names_str, str) else verifier_names_str
+
+    classifier_thresholds = edge_weights.get('classifier_thresholds', {})
+    classifier_units = {}
+
+    do_robust_plot = "auto_threshold_plot_path" in config.get("logging", {})
+    robust_plot_path = config.get("logging", {}).get("auto_threshold_plot_path", "dist.png")
+
+    # Process direct thresholds
+    for name in classifier_thresholds:
+        if name not in common_data['embeddings_dict']:
+            continue
+        embeddings = common_data['embeddings_dict'][name]
+        if isinstance(embeddings, types.FunctionType):
+            embeddings = embeddings()
+
+        threshold = classifier_thresholds[name]
+        if isinstance(threshold, str) and "auto" in threshold:
+            match = re.match(r'auto\((\d+\.?\d*)\)', threshold)
+            threshold_fraction = float(match.group(1)) if match else 0.15
+
+            unfiltered_embeddings_dict = common_data.get('unfiltered_embeddings_dict', {})
+            if name in unfiltered_embeddings_dict:
+                thresh_embeddings = unfiltered_embeddings_dict[name]
+                if isinstance(thresh_embeddings, types.FunctionType):
+                    thresh_embeddings = thresh_embeddings()
+            else:
+                thresh_embeddings = embeddings
+
+            if hasattr(embeddings, 'get_base'):
+                thresh_embeddings = embeddings.get_base()
+
+            threshold = robust_gmm_find_threshold(
+                np.array(thresh_embeddings.get_all_scores()),
+                entropy_alpha=1 - threshold_fraction,
+                verbose=True,
+                print_func=logger.info,
+                plot_path=robust_plot_path
+            )
+
+        classifier = ThresholdBasedClassifier(threshold)
+        logger.info(f"Created threshold-based classifier for {name} with threshold {threshold}")
+        classifier_units[name] = (embeddings, classifier)
+
+    # Fallback for verifiers without explicit thresholds
+    for name in verifier_names:
+        if 'human' in name:
+            continue
+        if name not in classifier_units:
+            embeddings = common_data['embeddings_dict'].get(name)
+            if embeddings is None:
+                continue
+
+            unfiltered_embeddings_dict = common_data.get('unfiltered_embeddings_dict', {})
+            if name in unfiltered_embeddings_dict:
+                thresh_embeddings = unfiltered_embeddings_dict[name]
+                if isinstance(thresh_embeddings, types.FunctionType):
+                    thresh_embeddings = thresh_embeddings()
+            else:
+                thresh_embeddings = embeddings
+
+            threshold = robust_gmm_find_threshold(
+                np.array(thresh_embeddings.get_all_scores()),
+                verbose=True,
+                print_func=logger.info,
+                plot_path=robust_plot_path,
+            )
+            classifier = ThresholdBasedClassifier(threshold)
+            classifier_units[name] = (embeddings, classifier)
+
+    classifier_manager = ClassifierManager(
+        verifier_names=verifier_names,
+        classifier_units=classifier_units
+    )
+
+    # Pass the classifier threshold to the algorithm config so it can
+    # derive dbscan_eps='auto' from it (similarity -> cosine distance)
+    verifier_name = np3_config.get('verifier_name', 'miewid')
+    if verifier_name in classifier_units:
+        _, classifier_obj = classifier_units[verifier_name]
+        np3_config['classifier_threshold'] = classifier_obj.threshold
+        logger.info(f"Classifier threshold for {verifier_name}: {classifier_obj.threshold:.4f}")
+
+    logger.info(f"NP3+AAS algorithm config:")
+    logger.info(f"  dbscan_eps: {np3_config['dbscan_eps']}")
+    logger.info(f"  dbscan_min_samples: {np3_config['dbscan_min_samples']}")
+    logger.info(f"  s_min: {np3_config['s_min']}")
+    logger.info(f"  k_max: {np3_config['k_max']}")
+    logger.info(f"  epsilon: {np3_config['epsilon']}")
+    logger.info(f"  max_human_reviews: {np3_config['max_human_reviews']}")
+    logger.info(f"  edges_per_review_batch: {np3_config['edges_per_review_batch']}")
+
+    return NP3AASAlgorithm(
+        np3_config,
+        classifier_manager=classifier_manager,
+        cluster_validator=common_data['cluster_validator']
+    )
+
+
+def prepare_nis(common_data, config):
+    """
+    Prepare NIS + k-means algorithm instance.
+
+    Uses Nested Importance Sampling to estimate the number of clusters K,
+    then runs k-means with k=K_hat. Based on Perez et al. (ECCV 2024).
+
+    Args:
+        common_data: Common data from prepare_common
+        config: Configuration dictionary
+
+    Returns:
+        NISAlgorithm: Configured algorithm instance
+    """
+    nis_config = config.get('nis', {}).copy()
+
+    # Merge edge_weights settings
+    edge_weights = config.get('edge_weights', {})
+    nis_config['prob_human_correct'] = edge_weights.get('prob_human_correct', 0.98)
+
+    # Set defaults
+    nis_config.setdefault('n_sampled_vertices', 50)
+    nis_config.setdefault('m_neighbors_per_vertex', 100)
+    nis_config.setdefault('temperature', 0.5)
+    nis_config.setdefault('max_human_reviews', 5000)
+    nis_config.setdefault('edges_per_review_batch', 200)
+    nis_config.setdefault('validation_step', 100)
+    nis_config.setdefault('verifier_name', common_data['verifier_name'])
+
+    # Build classifier manager (same pattern as prepare_np3_aas)
+    verifier_names_str = edge_weights.get('verifier_names',
+                                          edge_weights.get('augmentation_names', 'miewid human'))
+    verifier_names = verifier_names_str.split() if isinstance(verifier_names_str, str) else verifier_names_str
+
+    classifier_thresholds = edge_weights.get('classifier_thresholds', {})
+    classifier_units = {}
+
+    robust_plot_path = config.get("logging", {}).get("auto_threshold_plot_path", "dist.png")
+
+    # Process direct thresholds
+    for name in classifier_thresholds:
+        if name not in common_data['embeddings_dict']:
+            continue
+        embeddings = common_data['embeddings_dict'][name]
+        if isinstance(embeddings, types.FunctionType):
+            embeddings = embeddings()
+
+        threshold = classifier_thresholds[name]
+        if isinstance(threshold, str) and "auto" in threshold:
+            match = re.match(r'auto\((\d+\.?\d*)\)', threshold)
+            threshold_fraction = float(match.group(1)) if match else 0.15
+
+            unfiltered_embeddings_dict = common_data.get('unfiltered_embeddings_dict', {})
+            if name in unfiltered_embeddings_dict:
+                thresh_embeddings = unfiltered_embeddings_dict[name]
+                if isinstance(thresh_embeddings, types.FunctionType):
+                    thresh_embeddings = thresh_embeddings()
+            else:
+                thresh_embeddings = embeddings
+
+            if hasattr(embeddings, 'get_base'):
+                thresh_embeddings = embeddings.get_base()
+
+            threshold = robust_gmm_find_threshold(
+                np.array(thresh_embeddings.get_all_scores()),
+                entropy_alpha=1 - threshold_fraction,
+                verbose=True,
+                print_func=logger.info,
+                plot_path=robust_plot_path
+            )
+
+        classifier = ThresholdBasedClassifier(threshold)
+        logger.info(f"Created threshold-based classifier for {name} with threshold {threshold}")
+        classifier_units[name] = (embeddings, classifier)
+
+    # Fallback for verifiers without explicit thresholds
+    for name in verifier_names:
+        if 'human' in name:
+            continue
+        if name not in classifier_units:
+            embeddings = common_data['embeddings_dict'].get(name)
+            if embeddings is None:
+                continue
+
+            unfiltered_embeddings_dict = common_data.get('unfiltered_embeddings_dict', {})
+            if name in unfiltered_embeddings_dict:
+                thresh_embeddings = unfiltered_embeddings_dict[name]
+                if isinstance(thresh_embeddings, types.FunctionType):
+                    thresh_embeddings = thresh_embeddings()
+            else:
+                thresh_embeddings = embeddings
+
+            threshold = robust_gmm_find_threshold(
+                np.array(thresh_embeddings.get_all_scores()),
+                verbose=True,
+                print_func=logger.info,
+                plot_path=robust_plot_path,
+            )
+            classifier = ThresholdBasedClassifier(threshold)
+            classifier_units[name] = (embeddings, classifier)
+
+    classifier_manager = ClassifierManager(
+        verifier_names=verifier_names,
+        classifier_units=classifier_units
+    )
+
+    logger.info(f"NIS algorithm config:")
+    logger.info(f"  n_sampled_vertices: {nis_config['n_sampled_vertices']}")
+    logger.info(f"  m_neighbors_per_vertex: {nis_config['m_neighbors_per_vertex']}")
+    logger.info(f"  temperature: {nis_config['temperature']}")
+    logger.info(f"  max_human_reviews: {nis_config['max_human_reviews']}")
+    logger.info(f"  edges_per_review_batch: {nis_config['edges_per_review_batch']}")
+
+    return NISAlgorithm(
+        nis_config,
+        classifier_manager=classifier_manager,
+        cluster_validator=common_data['cluster_validator']
+    )
 
 
 def call_verifier_alg(embeddings):
