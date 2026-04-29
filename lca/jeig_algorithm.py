@@ -164,6 +164,7 @@ class LCAv3JEIGAlgorithm:
                 ranker = "human"
                 # manual assignment
                 confidence = 1 if score > 0.5 else -1
+                # print(f"HUMAN EDGE {confidence}")
             else:
                 classified = self.classifier_manager.classify_edge(n0, n1, verifier_name)
                 _, _, _, confidence, label, ranker = classified
@@ -171,6 +172,8 @@ class LCAv3JEIGAlgorithm:
                 # If negative edge, flip confidence to negative scale
                 if label == "negative":
                     confidence *= -1
+
+                # print(f"EDGE {confidence} {label} {verifier_name} {ranker}")
 
             # Add query history
             if (u, v) not in self.query_history:
@@ -404,10 +407,10 @@ class LCAv3JEIGAlgorithm:
             # Terminate if the graph is stable (check raw IG, not noisy)
             best_idx = pool_edges.index(sorted_edges[0])
             top_raw_ig = base_entropies_arr[best_idx] - (1.0 / m) * alpha_JEIG_arr[best_idx]
-            if top_raw_ig < 0.00001:
-                logger.info("JEIG Converged: Max expected information gain is virtually zero.")
-                self.phase = "FINISHED"
-                return []
+            # if top_raw_ig < 0.00001:
+            #     logger.info("JEIG Converged: Max expected information gain is virtually zero.")
+            #     self.phase = "FINISHED"
+            #     return []
         
         # Gumbel sampling of top batch size
         return [(u, v, "human") for u, v in sorted_edges[:self.batch_size]]
