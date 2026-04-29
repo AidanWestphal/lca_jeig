@@ -48,6 +48,7 @@ class LCAv3JEIGAlgorithm:
         
         logger.info("LCA v3 JEIG Algorithm initialized")
 
+
     def step(self, new_edges: List[Tuple]) -> List[Tuple[int, int, float]]:
         if self.is_finished():
             return []
@@ -66,18 +67,12 @@ class LCAv3JEIGAlgorithm:
 
         # 3. Calculate Mean Field Approximation (Global Q)
         self.Q = self._calculate_mean_field(self.M)
-        
-        # 4. Generate Candidate Pool (Uncertain edges -- haven't been viewed by a human)
-        candidate_pool = self._generate_candidate_pool()
-        if not candidate_pool:
-            logger.info("No candidates available. Marking as finished.")
-            self.phase = "FINISHED"
-            return []
 
         # 5. Run Monte Carlo JEIG on candidates to find best batch
-        best_batch = self._run_monte_carlo_jeig(candidate_pool)
+        best_batch = self._run_monte_carlo_jeig()
         
         return best_batch
+
 
     def is_finished(self) -> bool:
         if self.phase == "FINISHED":
@@ -87,6 +82,7 @@ class LCAv3JEIGAlgorithm:
             self.phase = "FINISHED"
             return True
         return False
+
 
     def get_clustering(self) -> Tuple[Dict, Dict, nx.Graph]:
         # Recalculate clusters for the output signature
@@ -100,6 +96,39 @@ class LCAv3JEIGAlgorithm:
                 node2cid[node] = cid
                 
         return cluster_dict, node2cid, self.G
+
+
+    def _log_incremental_metrics(self, max_jeig_score=None):
+        """Logs Hungarian metrics and JEIG scores during iterations for graph parsing."""
+        if not self.cluster_validator:
+            return
+
+        # Get current clustering state
+        clustering, node2cid, _ = self.get_clustering()
+
+        # =========================================================
+        # FIX: Convert clustering lists to sets! 
+        # LCA's cluster_tools.py expects sets to use the .add() method.
+        # =========================================================
+        clustering_as_sets = {cid: set(nodes) for cid, nodes in clustering.items()}
+
+        # Extract the ground truth data from the validator
+        true_clustering = self.cluster_validator.gt_clustering
+        true_node2cid = self.cluster_validator.gt_node2cid
+
+        # Calculate and log Hungarian F1, Recall, and Precision
+        self.cluster_validator.incremental_stats(
+            self.num_human_reviews,
+            clustering_as_sets,  # Pass the sets here!
+            node2cid,
+            true_clustering,
+            true_node2cid
+        )
+
+        # Log the JEIG score trend explicitly for easy parsing
+        if max_jeig_score is not None:
+            logger.info(f"JEIG_Trend num_human={self.num_human_reviews}, max_jeig_score={max_jeig_score:.8f}")
+
 
     def _mean_query_history(self, u, v):
         # Weighted mean over query history for an edge u - v
@@ -116,27 +145,34 @@ class LCAv3JEIGAlgorithm:
 
         return sum_score / count_score if count_score > 0 else 0
 
+
     def _process_and_add_edges(self, new_edges: List[Tuple]):
         # Over all new edges...
         for edge in new_edges:
             n0, n1, score, verifier_name = edge[:4]
             u, v = min(n0, n1), max(n0, n1)
             
+            # Algorithmic classifier gives confidence between 0-1 and label
+            classified = self.classifier_manager.classify_edge(n0, n1, verifier_name)
+            _, _, _, confidence, label, ranker = classified
+
+            # If negative edge, flip confidence to negative scale
+            if label == "negative":
+                confidence *= -1
+
+            # print(f"SCORE CONFIDENCE LABEL {score} {confidence} {label}")
+
             # Seen by human, add human review to overall count
             if verifier_name in {'human', 'simulated_human', 'ui_human'}:
                 self.num_human_reviews += 1
                 # No high scores or anything, just clean. Human can give uncertain 0.5 and be fine
-                math_score = score
                 ranker = "human"
-            else:
-                math_score = score
-                ranker = verifier_name
             
             # Add query history
             if (u, v) not in self.query_history:
                 self.query_history[(u, v)] = []
                 
-            self.query_history[(u, v)].append((math_score, ranker))
+            self.query_history[(u, v)].append((confidence, ranker))
             
             # Average query history for new score
             avg_score = self._mean_query_history(u, v)
@@ -147,6 +183,7 @@ class LCAv3JEIGAlgorithm:
                 self.G.edges[u, v]["ranker"] = ranker
             else:
                 self.G.add_edge(u, v, score=avg_score, ranker=ranker)
+
 
     def _calculate_pcc_clusters(self):
         # Read current graph to generate clustering
@@ -164,6 +201,7 @@ class LCAv3JEIGAlgorithm:
         clusters.extend(singletons)
         return clusters
 
+
     def _build_similarity_matrix(self):
         # Build similarity matrix for the current graph
         nodes = list(self.G.nodes())
@@ -177,11 +215,11 @@ class LCAv3JEIGAlgorithm:
         
         for u, v, data in self.G.edges(data=True):
             i, j = self.node2idx[u], self.node2idx[v]
-            # Zero-centered similarity [0,1] -> [-1, 1]
-            val = 2 * (data['score'] - self.threshold)
-            self.S[i, j] = val
-            self.S[j, i] = val
+
+            self.S[i, j] = data['score']
+            self.S[j, i] = data['score']
     
+
     def _build_M_matrix(self, clustering):
         # Build affinity matrix (scores/cost of cluster assignment)
         n_nodes = len(self.node2idx)
@@ -196,6 +234,7 @@ class LCAv3JEIGAlgorithm:
                 M[:, k] = -np.sum(self.S[:, cluster_indices], axis=1)
         
         return M
+
 
     def _calculate_mean_field(self, M_init, S_conditional=[]):
         """Calculates Q: The probability distribution of nodes over clusters."""
@@ -230,57 +269,21 @@ class LCAv3JEIGAlgorithm:
         return Q
 
 
-    def _gumbel_softmax_sample(self, p_pos: float, tau: float = 0.5) -> float:
-        """Draws a soft label [-1, 1] using Gumbel-Softmax relaxation."""
-        p_pos = np.clip(p_pos, 1e-10, 1.0 - 1e-10)
-        p_neg = 1.0 - p_pos
-
-        g_pos = -np.log(-np.log(np.random.uniform(1e-10, 1.0)))
-        g_neg = -np.log(-np.log(np.random.uniform(1e-10, 1.0)))
-
-        logit_pos = (np.log(p_pos) + g_pos) / tau
-        logit_neg = (np.log(p_neg) + g_neg) / tau
-
-        max_logit = max(logit_pos, logit_neg)
-        exp_pos = np.exp(logit_pos - max_logit)
-        exp_neg = np.exp(logit_neg - max_logit)
-
-        sum_exp = exp_pos + exp_neg
+    def _run_monte_carlo_jeig(self) -> List[Tuple]:
+        num_edges = len(self.G.edges)
+        logger.debug(f"Executing JEIG over {num_edges} edges.")
         
-        # Returns a continuous soft-label
-        return (exp_pos / sum_exp * 1.0) + (exp_neg / sum_exp * -1.0)
-
-
-    def _generate_candidate_pool(self) -> Dict[Tuple, float]:
-        """
-        Calculates entropy for ALL edges. Human-reviewed edges will naturally 
-        have ~0 entropy and fall to the bottom. Returns the Top N most uncertain.
-        """
-        edge_entropies = {}
+        m = self.pair_sample_count
+        n = self.cluster_sample_count
+        sample_size = self.batch_size if isinstance(self.batch_size, int) else max(1, self.batch_size * num_edges)
         
-        for u, v in self.G.edges():
-            edge_entropies[(u, v)] = self._calculate_entropy((u, v), self.Q)
-            
-        # Sort by highest entropy and take the top N (e.g., 50 or 500)
-        sorted_edges = sorted(edge_entropies, key=edge_entropies.get, reverse=True)[:self.candidate_pool_size]
-        
-        return {edge: edge_entropies[edge] for edge in sorted_edges}
-
-
-    def _run_monte_carlo_jeig(self, candidate_pool: Dict[Tuple, float]) -> List[Tuple]:
-        logger.debug(f"Executing JEIG over Candidate Pool of {len(candidate_pool)}.")
-        
-        m = 5       # M subsets
-        n = 50      # N configurations
-        tau = 0.5   # Gumbel Temperature
-        
-        pool_edges = list(candidate_pool.keys())
+        pool_edges = list(self.G.edges)
         alpha_JEIG = {edge: 0.0 for edge in pool_edges}
         
-        # Outer Loop: Select M subsets (size 1)
+        # Outer Loop: Select M subsets
         for i in range(m):
-            Di = random.sample(pool_edges, 1)
-            
+            Di = random.sample(pool_edges, sample_size)
+            # Precalculate probability values
             Di_probs = []
             for edge in Di:
                 u, v = edge
@@ -292,22 +295,28 @@ class LCAv3JEIGAlgorithm:
             for j in range(n):
                 S_conditional = []
                 
-                # Sample configuration using Gumbel-Softmax
+                # Sample configuration
                 for edge, p_pos in Di_probs:
-                    soft_label = self._gumbel_softmax_sample(p_pos, tau=tau)
-                    S_conditional.append((edge, soft_label))
-                    
-                # Rerun Mean Field with the SOFT configuration
+                    # Select off Di probs
+                    edge_label = np.random.choice([1, -1], p=[p_pos, 1 - p_pos])
+                    S_conditional.append((edge, edge_label))
+                
+                # Rerun Mean Field with the sampled labels
                 Q_cond = self._calculate_mean_field(self.M, S_conditional)
                 
                 # Accumulate the conditional entropy for the candidate pool
                 for edge in pool_edges:
                     alpha_JEIG[edge] += (1.0 / n) * self._calculate_entropy(edge, Q_cond)
                     
-        # Calculate Final Information Gain: I = H(e) - E[H(e|Di)]
+        # Calculate Final Information Gain: I = H(e) - E[H(e|Di)] w/ gumbel noise and log
         I_JEIG = {}
-        for edge, base_entropy in candidate_pool.items():
-            I_JEIG[edge] = base_entropy - (1.0 / m) * alpha_JEIG[edge]
+        for edge in self.G.edges:
+            # Calculate Information Gain
+            raw_ig = self._calculate_entropy(edge, self.Q) - (1.0 / m) * alpha_JEIG[edge]
+
+            # Safeguard against log2(<=0) from MC sampling noise
+            safe_ig = max(raw_ig, 1e-10)
+            I_JEIG[edge] = np.log2(safe_ig) + np.random.gumbel(loc=0.0, scale=1.0)
             
         sorted_edges = sorted(I_JEIG, key=I_JEIG.get, reverse=True)
         
@@ -315,28 +324,24 @@ class LCAv3JEIGAlgorithm:
             top_score = I_JEIG[sorted_edges[0]]
             avg_score = np.mean(list(I_JEIG.values()))
             logger.info(f"JEIG Status | Top EIG: {top_score:.5f} | Avg EIG: {avg_score:.5f}")
+
+            # =========================================================
+            # LOG METRICS BEFORE ASKING HUMAN OR TERMINATING
+            # This handles F1, Recall, Precision, and the JEIG trend
+            # =========================================================
+            self._log_incremental_metrics(max_jeig_score=top_score)
             
             # Terminate if the graph is stable
-            if top_score < 0.0001:
+            if top_score < 0.00001:
                 logger.info("JEIG Converged: Max expected information gain is virtually zero.")
                 self.phase = "FINISHED"
                 return []
-                
+        
+        # Gumbel sampling of top batch size
+
         return [(u, v, "human") for u, v in sorted_edges[:self.batch_size]]
-    
-    # def _get_unreviewed_edges(self) -> List[Tuple]:
-    #     """Returns all edges in the graph that have not yet been reviewed by a human."""
-    #     unreviewed_edges = []
-    #     for u, v in self.G.edges():
-    #         # Check your query history
-    #         history = self.query_history.get((u, v), [])
-    #         is_human_reviewed = any(ranker == 'human' for score, ranker in history)
-            
-    #         if not is_human_reviewed:
-    #             unreviewed_edges.append((u, v))
-                
-    #     return unreviewed_edges
-    
+
+
     def _calculate_entropy(self, edge, Q):
         # Calculate entropy for an edge conditional on Q probs
         u, v = edge
