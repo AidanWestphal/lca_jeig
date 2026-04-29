@@ -1,3 +1,4 @@
+import itertools
 import networkx as nx
 import numpy as np
 import scipy.sparse as sp
@@ -59,8 +60,8 @@ class LCAv3JEIGAlgorithm:
         if len(self.G.nodes()) < 2:
             return []
 
-        # 2. Re-calculate Base Clustering (PCCs) & Build Similarity Matrix
-        clusters = self._calculate_pcc_clusters()
+        # 2. Re-calculate Base Clustering (Local Search) & Build Similarity Matrix
+        clusters = self._calculate_local_search_clusters()
         self._build_similarity_matrix()
         
         self.M = self._build_M_matrix(clusters)
@@ -86,7 +87,7 @@ class LCAv3JEIGAlgorithm:
 
     def get_clustering(self) -> Tuple[Dict, Dict, nx.Graph]:
         # Recalculate clusters for the output signature
-        clusters = self._calculate_pcc_clusters()
+        clusters = self._calculate_local_search_clusters()
         node2cid = {}
         cluster_dict = {}
         
@@ -152,22 +153,25 @@ class LCAv3JEIGAlgorithm:
             n0, n1, score, verifier_name = edge[:4]
             u, v = min(n0, n1), max(n0, n1)
             
-            # Algorithmic classifier gives confidence between 0-1 and label
-            classified = self.classifier_manager.classify_edge(n0, n1, verifier_name)
-            _, _, _, confidence, label, ranker = classified
-
-            # If negative edge, flip confidence to negative scale
-            if label == "negative":
-                confidence *= -1
-
-            # print(f"SCORE CONFIDENCE LABEL {score} {confidence} {label}")
+            # Ensure nodes are registered in the graph
+            if not self.G.has_node(u): self.G.add_node(u)
+            if not self.G.has_node(v): self.G.add_node(v)
+            
 
             # Seen by human, add human review to overall count
             if verifier_name in {'human', 'simulated_human', 'ui_human'}:
                 self.num_human_reviews += 1
-                # No high scores or anything, just clean. Human can give uncertain 0.5 and be fine
                 ranker = "human"
-            
+                # manual assignment
+                confidence = 1 if score > 0.5 else -1
+            else:
+                classified = self.classifier_manager.classify_edge(n0, n1, verifier_name)
+                _, _, _, confidence, label, ranker = classified
+
+                # If negative edge, flip confidence to negative scale
+                if label == "negative":
+                    confidence *= -1
+
             # Add query history
             if (u, v) not in self.query_history:
                 self.query_history[(u, v)] = []
@@ -185,21 +189,60 @@ class LCAv3JEIGAlgorithm:
                 self.G.add_edge(u, v, score=avg_score, ranker=ranker)
 
 
-    def _calculate_pcc_clusters(self):
-        # Read current graph to generate clustering
-        positive_edges = [
-            (u, v) for u, v, data in self.G.edges(data=True) 
-            if data['score'] >= self.threshold
-        ]
-        pos_G = self.G.edge_subgraph(positive_edges)
+    def _calculate_local_search_clusters(self):
+        # Local Search Algorithm for Correlation Clustering (Alg. 2)
+        nodes = list(self.G.nodes())
+        if not nodes:
+            return []
+            
+        # 1: Randomly assign each object to a cluster
+        node2cid = {node: i for i, node in enumerate(nodes)}
+        clusters = {i: {node} for i, node in enumerate(nodes)}
         
-        clusters = [list(c) for c in nx.connected_components(pos_G)]
+        changed = True
+        max_iters = 100
+        iters = 0
         
-        clustered_nodes = set().union(*clusters) if clusters else set()
-        singletons = [[n] for n in self.G.nodes() if n not in clustered_nodes]
-        
-        clusters.extend(singletons)
-        return clusters
+        # 2: while not converged do
+        while changed and iters < max_iters:
+            changed = False
+            # 3: Select object i randomly
+            random.shuffle(nodes) 
+            
+            for u in nodes:
+                current_cid = node2cid[u]
+                
+                # 4: Assign object i to the cluster that maximally increases the objective
+                cluster_sims = {}
+                for v in self.G.neighbors(u):
+                    v_cid = node2cid[v]
+                    cluster_sims[v_cid] = cluster_sims.get(v_cid, 0) + self.G.edges[u, v]['score']
+                
+                best_cid = None
+                best_sim = 0.0 
+                
+                for cid, sim in cluster_sims.items():
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_cid = cid
+                        
+                # If no existing cluster yields an increase, form a new cluster
+                if best_cid is None:
+                    best_cid = max(clusters.keys(), default=0) + 1
+                    clusters[best_cid] = set()
+                    
+                if best_cid != current_cid:
+                    clusters[current_cid].remove(u)
+                    if not clusters[current_cid]:
+                        del clusters[current_cid]
+                    
+                    clusters[best_cid].add(u)
+                    node2cid[u] = best_cid
+                    changed = True
+                    
+            iters += 1
+            
+        return [list(c) for c in clusters.values() if c]
 
 
     def _build_similarity_matrix(self):
@@ -269,20 +312,52 @@ class LCAv3JEIGAlgorithm:
         return Q
 
 
+    def _calc_entropies_fast(self, U_idx: np.ndarray, V_idx: np.ndarray, Q: np.ndarray) -> np.ndarray:
+        """Vectorized calculation of entropy for a batch of edges."""
+        p_pos = np.sum(Q[U_idx] * Q[V_idx], axis=1)
+        
+        # Epsilon safeguard to prevent np.log2(0) == -inf crashes
+        eps = 1e-10
+        p_pos = np.clip(p_pos, eps, 1.0 - eps)
+        p_neg = 1.0 - p_pos
+        
+        return -p_pos * np.log2(p_pos) - p_neg * np.log2(p_neg)
+
+
     def _run_monte_carlo_jeig(self) -> List[Tuple]:
-        num_edges = len(self.G.edges)
+        # Filter down to known edges only per Top-K strategy
+        pool_edges = list(self.G.edges)
+        if not pool_edges:
+            return []
+            
+        num_edges = len(pool_edges)
         logger.debug(f"Executing JEIG over {num_edges} edges.")
         
         m = self.pair_sample_count
         n = self.cluster_sample_count
-        sample_size = self.batch_size if isinstance(self.batch_size, int) else max(1, self.batch_size * num_edges)
+        sample_size = self.batch_size if isinstance(self.batch_size, int) else max(1, int(self.batch_size * num_edges))
         
-        pool_edges = list(self.G.edges)
-        alpha_JEIG = {edge: 0.0 for edge in pool_edges}
+        # Pre-extract indices to vectorize inner loops
+        U_idx = np.array([self.node2idx[u] for u, v in pool_edges])
+        V_idx = np.array([self.node2idx[v] for u, v in pool_edges])
+        
+        # Initialize accumulation array (much faster than dict)
+        alpha_JEIG_arr = np.zeros(num_edges)
+        
+        # Vectorized base entropy calculation
+        base_entropies_arr = self._calc_entropies_fast(U_idx, V_idx, self.Q)
+        base_entropies = dict(zip(pool_edges, base_entropies_arr))
         
         # Outer Loop: Select M subsets
         for i in range(m):
-            Di = random.sample(pool_edges, sample_size)
+            # Select top-|Di| pairs using Gumbel + Log Entropy
+            noisy_entropies = {
+                edge: np.log2(max(ent, 1e-10)) + np.random.gumbel() 
+                for edge, ent in base_entropies.items()
+            }
+            sorted_by_noisy_ent = sorted(noisy_entropies, key=noisy_entropies.get, reverse=True)
+            Di = sorted_by_noisy_ent[:sample_size]
+            
             # Precalculate probability values
             Di_probs = []
             for edge in Di:
@@ -304,19 +379,14 @@ class LCAv3JEIGAlgorithm:
                 # Rerun Mean Field with the sampled labels
                 Q_cond = self._calculate_mean_field(self.M, S_conditional)
                 
-                # Accumulate the conditional entropy for the candidate pool
-                for edge in pool_edges:
-                    alpha_JEIG[edge] += (1.0 / n) * self._calculate_entropy(edge, Q_cond)
+                # Fast Vectorized Accumulation
+                alpha_JEIG_arr += (1.0 / n) * self._calc_entropies_fast(U_idx, V_idx, Q_cond)
                     
         # Calculate Final Information Gain: I = H(e) - E[H(e|Di)] w/ gumbel noise and log
         I_JEIG = {}
-        for edge in self.G.edges:
-            # Calculate Information Gain
-            raw_ig = self._calculate_entropy(edge, self.Q) - (1.0 / m) * alpha_JEIG[edge]
-
-            # Safeguard against log2(<=0) from MC sampling noise
-            safe_ig = max(raw_ig, 1e-10)
-            I_JEIG[edge] = np.log2(safe_ig) + np.random.gumbel(loc=0.0, scale=1.0)
+        for idx, edge in enumerate(pool_edges):
+            raw_ig = base_entropies_arr[idx] - (1.0 / m) * alpha_JEIG_arr[idx]
+            I_JEIG[edge] = np.log2(max(raw_ig, 1e-10)) + np.random.gumbel(loc=0.0, scale=1.0)
             
         sorted_edges = sorted(I_JEIG, key=I_JEIG.get, reverse=True)
         
@@ -331,19 +401,20 @@ class LCAv3JEIGAlgorithm:
             # =========================================================
             self._log_incremental_metrics(max_jeig_score=top_score)
             
-            # Terminate if the graph is stable
-            if top_score < 0.00001:
+            # Terminate if the graph is stable (check raw IG, not noisy)
+            best_idx = pool_edges.index(sorted_edges[0])
+            top_raw_ig = base_entropies_arr[best_idx] - (1.0 / m) * alpha_JEIG_arr[best_idx]
+            if top_raw_ig < 0.00001:
                 logger.info("JEIG Converged: Max expected information gain is virtually zero.")
                 self.phase = "FINISHED"
                 return []
         
         # Gumbel sampling of top batch size
-
         return [(u, v, "human") for u, v in sorted_edges[:self.batch_size]]
 
 
     def _calculate_entropy(self, edge, Q):
-        # Calculate entropy for an edge conditional on Q probs
+        """Kept for backward compatibility if needed, though replaced by _calc_entropies_fast in hot loops."""
         u, v = edge
         idu, idv = self.node2idx[u], self.node2idx[v]
         
@@ -373,7 +444,6 @@ class LCAv3JEIGAlgorithm:
         stats_logger.info(f"Final Edges: {len(self.G.edges())}")
         
         # Calculate clusters if not None
-        num_clusters = len(self._calculate_pcc_clusters()) if self.G.nodes() else 0
-        stats_logger.info(f"Final Clusters (PCCs): {num_clusters}")
+        num_clusters = len(self._calculate_local_search_clusters()) if self.G.nodes() else 0
+        stats_logger.info(f"Final Clusters (Local Search): {num_clusters}")
         stats_logger.info("=" * 60)
-        

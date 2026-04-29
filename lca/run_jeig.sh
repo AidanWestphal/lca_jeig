@@ -12,7 +12,7 @@ for species in beluga forestelephants GZCD giraffe lion plainszebra whaleshark; 
     echo "=== ${species} ==="
     python3 run_clustering_with_save.py \
         --base_config ${BASE_CONFIG} \
-        --config configs/${species}/config_${species}_data.yaml
+        --config configs/config_${species}_data.yaml
     echo ""
 done
 
